@@ -3,6 +3,8 @@ import io
 import sys
 import asyncio
 import warnings
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import pandas as pd
 import yfinance as yf
 from datetime import datetime
@@ -38,12 +40,30 @@ SUBSCRIBERS_FILE = "subscribers.txt"
 WAITING_CUSTOM_CAPITAL = 1
 
 # =====================================================================
-# SUBSCRIBER DATABASE ENGINE (TXT-BASED PERSISTENCE)
+# DUMMY WEB SERVER (KEEPS RENDER FREE SERVICE HEALTHY & ONLINE)
+# =====================================================================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Nifty 50 Bot is Online and Healthy!")
+
+    def log_message(self, format, *args):
+        # Silence HTTP access logs to keep bot terminal clean
+        return
+
+def run_health_server():
+    port = int(os.environ.get("PORT", 10000))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# =====================================================================
+# SUBSCRIBER DATABASE ENGINE
 # =====================================================================
 def load_subscribers():
-    """Reads all saved chat IDs from the subscribers file."""
     subs = set()
-    subs.add(str(ADMIN_CHAT_ID))  # Admin is always subscribed
+    subs.add(str(ADMIN_CHAT_ID))
     if os.path.exists(SUBSCRIBERS_FILE):
         with open(SUBSCRIBERS_FILE, "r") as f:
             for line in f:
@@ -53,7 +73,6 @@ def load_subscribers():
     return list(subs)
 
 def save_subscriber(chat_id):
-    """Adds a new chat ID to the subscribers file if not already present."""
     subs = load_subscribers()
     if str(chat_id) not in subs:
         with open(SUBSCRIBERS_FILE, "a") as f:
@@ -62,7 +81,7 @@ def save_subscriber(chat_id):
     return False
 
 # =====================================================================
-# TELEGRAM SAFE DISPATCH (Splits long messages)
+# TELEGRAM SAFE DISPATCH
 # =====================================================================
 async def send_chunked_message(bot, chat_id, text, reply_markup=None):
     max_len = 3800
@@ -395,7 +414,7 @@ async def run_all_three_for_user(bot, chat_id):
     await send_chunked_message(bot, chat_id, plan_msg)
 
 # =====================================================================
-# UI MENU WITH THE NEW BUTTON
+# UI MENU
 # =====================================================================
 def get_main_menu():
     keyboard = [
@@ -433,7 +452,7 @@ async def send_file(bot, chat_id, filepath):
         await bot.send_message(chat_id=chat_id, text=f"⚠️ File `{filepath}` not found. Run the scan first.")
 
 # =====================================================================
-# HANDLERS & CALLBACK DISPATCH
+# HANDLERS & CALLBACK ROUTING
 # =====================================================================
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -453,7 +472,6 @@ async def main_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
     user = query.from_user
     data = query.data
 
-    # --- NEW: AUTO-SUBSCRIBE HANDLER ---
     if data == "btn_subscribe":
         is_new = save_subscriber(chat_id)
         if is_new:
@@ -463,7 +481,6 @@ async def main_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
                 "You will now automatically receive the full market scan, actionable watchlists, and Entry/SL/TP levels every trading day at *08:45 AM IST*.",
                 parse_mode="Markdown"
             )
-            # Notify you (the Admin) on Telegram
             try:
                 username_str = f"@{user.username}" if user.username else "No Username"
                 await context.bot.send_message(
@@ -532,6 +549,7 @@ async def main_callback_router(update: Update, context: ContextTypes.DEFAULT_TYP
         subs = load_subscribers()
         await query.message.reply_text(
             f"✅ *System Operational*\n"
+            f"• Host: Render Cloud Web Service\n"
             f"• Timezone: Indian Standard Time (IST)\n"
             f"• Auto Schedule: Mon-Fri @ 08:45 AM IST\n"
             f"• Current Time: `{now_ist}`\n"
@@ -566,7 +584,6 @@ async def morning_auto_scan(app):
         now = datetime.now(IST)
         # Mon-Fri at 08:45 AM IST
         if now.weekday() < 5 and now.hour == 8 and now.minute == 45:
-            # 1. Run the heavy 3 scans once in the background
             loop = asyncio.get_running_loop()
             await loop.run_in_executor(None, ema_primary_screener.screen_market)[cite: 1]
             await loop.run_in_executor(None, intraday_scanner.scan_nifty50)[cite: 2]
@@ -576,7 +593,6 @@ async def morning_auto_scan(app):
                 nifty50_scanner.write_excel(res)[cite: 3]
             await loop.run_in_executor(None, r3)
 
-            # 2. Build the morning Trade Plans & Actionable Watchlist
             plan_msg = generate_trade_plan_text()
             confluence_msg = get_multi_scanner_confluence()
 
@@ -587,12 +603,11 @@ async def morning_auto_scan(app):
                 f"{plan_msg}"
             )
 
-            # 3. Broadcast to all registered subscribers
             all_subscribers = load_subscribers()
             for sub_id in all_subscribers:
                 try:
                     await send_chunked_message(app.bot, sub_id, morning_package)
-                    await asyncio.sleep(0.1)  # Telegram broadcast anti-flood delay
+                    await asyncio.sleep(0.1)
                 except Exception as e:
                     print(f"Could not send to subscriber {sub_id}: {e}")
 
@@ -606,6 +621,10 @@ async def post_init(application):
     asyncio.create_task(morning_auto_scan(application))
 
 def main():
+    # Start the dummy web server in a background daemon thread for Render
+    web_thread = threading.Thread(target=run_health_server, daemon=True)
+    web_thread.start()
+
     app = ApplicationBuilder().token(BOT_TOKEN).post_init(post_init).build()
 
     custom_conv = ConversationHandler(
@@ -621,7 +640,7 @@ def main():
     app.add_handler(custom_conv)
     app.add_handler(CallbackQueryHandler(main_callback_router))
 
-    print("Command Center is online. Auto-subscriber system active.")
+    print("Command Center is online. Dummy health web server active on Render.")
     app.run_polling()
 
 if __name__ == "__main__":
